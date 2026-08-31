@@ -9,10 +9,18 @@
 - Automated tests cover metadata parsing, `ffprobe` timeout handling, scanner exclusion, planning conflicts, successful moves, progress reporting, and last-minute destination conflicts
 - A `.pyw` launcher starts the GUI without a terminal window
 - Custom Windows 95-style GUI emblem is included
+- GUI can safely flatten nested videos to the selected folder's top level, with confirmation and collision renaming
+- Scans use a four-worker metadata pool, persistent unchanged-file cache, and Cancel scan control
+- The latest Organize or Flatten operation can be undone safely from the GUI
+- Duplicate destination checks are Windows case-insensitive; optional safe renaming handles same-run duplicates
+- Production core module is named `organizer.py`
+- Move destinations are summarized as game folders with year subfolders and live per-folder progress
+- Large-folder movement animation is grouped by destination rather than playing once per clip
+- The interface now keeps Browse, Scan, and Organize as the primary workflow; advanced actions live in a compact top-right flyout
+- The complete text plan is hidden by default and can be opened with `+ Details`
+- The automated suite contains 20 tests, including cache, cancellation, stale-destination, rename, and undo flows
 
 ## Next
 
-- Add an undo log for an organization run
-- Offer a conflict-resolution choice such as skip or rename
 - Package the application with `ffprobe` availability checks for Windows distribution
-- Add a small integration test that exercises a full scan-to-move workflow with mocked metadata
+- Add a small GUI integration test that exercises scan, move, and undo with mocked metadata

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,8 @@ from typing import Callable
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm", ".wmv"}
 FFPROBE_TIMEOUT_SECONDS = 30
+MAX_METADATA_WORKERS = 4
+METADATA_CACHE_PATH = Path(__file__).resolve().parent / ".drive-sorter-state" / "metadata-cache.json"
 INVALID_FOLDER_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 ZERO_WIDTH_CHARACTERS = re.compile(r"[\u200b-\u200d\ufeff]")
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
@@ -32,6 +36,10 @@ class PlannedMove:
     clip: Clip
     destination: Path
     status: str
+
+
+class ScanCancelled(Exception):
+    """Raised when a scan is cancelled after active metadata reads finish."""
 
 
 def sanitize_folder_name(name: str) -> str | None:
@@ -53,13 +61,70 @@ def parse_creation_time(value: str | None) -> datetime | None:
         return None
 
 
+def path_key(path: Path) -> str:
+    """Return a Windows-safe comparison key for planned file destinations."""
+    return str(path).casefold()
+
+
+def _load_metadata_cache(cache_path: Path) -> dict[str, dict[str, object]]:
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        entries = payload.get("entries", {})
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return entries if isinstance(entries, dict) else {}
+
+
+def _cached_clip(file: Path, entries: dict[str, dict[str, object]]) -> Clip | None:
+    entry = entries.get(str(file.resolve()))
+    if not isinstance(entry, dict):
+        return None
+    stat = file.stat()
+    if entry.get("size") != stat.st_size or entry.get("mtime_ns") != stat.st_mtime_ns:
+        return None
+    game = entry.get("game")
+    year = entry.get("year")
+    error = entry.get("error")
+    if not isinstance(game, str) and game is not None:
+        return None
+    if not isinstance(year, int) and year is not None:
+        return None
+    if not isinstance(error, str) and error is not None:
+        return None
+    return Clip(file, game, year, error)
+
+
+def _cache_clip(file: Path, clip: Clip, entries: dict[str, dict[str, object]]) -> None:
+    if clip.metadata_error not in (None, "no usable game title in metadata"):
+        return
+    stat = file.stat()
+    entries[str(file.resolve())] = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "game": clip.game,
+        "year": clip.year,
+        "error": clip.metadata_error,
+    }
+
+
+def _save_metadata_cache(cache_path: Path, entries: dict[str, dict[str, object]]) -> None:
+    cache_path.parent.mkdir(exist_ok=True)
+    temporary_path = cache_path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+    temporary_path.replace(cache_path)
+
+
 def metadata_reader(file: Path) -> tuple[str | None, datetime | None, str | None]:
     """Read Game Bar metadata without allowing one bad file to stop the scan."""
+    process_options: dict[str, int] = {}
+    if os.name == "nt":
+        process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", str(file)],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             timeout=FFPROBE_TIMEOUT_SECONDS,
+            **process_options,
         )
     except FileNotFoundError:
         return None, None, "ffprobe was not found on PATH"
@@ -89,21 +154,78 @@ def file_scanner(
     folder: Path,
     output: Path,
     progress: Callable[[int, int, Path], None] | None = None,
+    workers: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    cache_path: Path | None = METADATA_CACHE_PATH,
 ) -> list[Clip]:
+    """Read clip metadata concurrently, with caching and cooperative cancellation."""
     clips: list[Clip] = []
     output = output.resolve()
-    files = [
-        file for file in folder.rglob("*")
-        if file.is_file()
-        and file.suffix.lower() in VIDEO_EXTENSIONS
-        and not file.resolve().is_relative_to(output)
-    ]
-    for index, file in enumerate(files, start=1):
-        game, creation_time, error = metadata_reader(file)
-        clips.append(Clip(file, game, creation_time.year if creation_time else None, error))
+    files = sorted(
+        (
+            file for file in folder.rglob("*")
+            if file.is_file()
+            and file.suffix.lower() in VIDEO_EXTENSIONS
+            and not file.resolve().is_relative_to(output)
+        ),
+        key=lambda file: str(file).lower(),
+    )
+    if not files:
+        return clips
+
+    worker_count = workers if workers is not None else min(MAX_METADATA_WORKERS, os.cpu_count() or 1)
+    results: list[Clip | None] = [None] * len(files)
+    entries = _load_metadata_cache(cache_path) if cache_path else {}
+    uncached: list[tuple[int, Path]] = []
+    completed = 0
+    for index, file in enumerate(files):
+        if cancelled and cancelled():
+            raise ScanCancelled
+        clip = _cached_clip(file, entries) if cache_path else None
+        if clip is None:
+            uncached.append((index, file))
+            continue
+        results[index] = clip
+        completed += 1
         if progress:
-            progress(index, len(files), file)
-    return clips
+            progress(completed, len(files), file)
+
+    with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
+        pending: dict[object, tuple[int, Path]] = {}
+        uncached_index = 0
+
+        def submit_next() -> bool:
+            nonlocal uncached_index
+            if uncached_index >= len(uncached):
+                return False
+            index, file = uncached[uncached_index]
+            uncached_index += 1
+            pending[executor.submit(metadata_reader, file)] = (index, file)
+            return True
+
+        for _ in range(min(worker_count, len(uncached))):
+            submit_next()
+        while pending:
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            if cancelled and cancelled():
+                for future in pending:
+                    future.cancel()
+                raise ScanCancelled
+            for future in finished:
+                index, file = pending.pop(future)
+                game, creation_time, error = future.result()
+                clip = Clip(file, game, creation_time.year if creation_time else None, error)
+                results[index] = clip
+                if cache_path:
+                    _cache_clip(file, clip, entries)
+                completed += 1
+                if progress:
+                    progress(completed, len(files), file)
+                if not (cancelled and cancelled()):
+                    submit_next()
+    if cache_path:
+        _save_metadata_cache(cache_path, entries)
+    return [clip for clip in results if clip is not None]
 
 
 def get_destination(clip: Clip, output: Path) -> Path:
@@ -114,18 +236,36 @@ def get_destination(clip: Clip, output: Path) -> Path:
     return output / clip.game / str(clip.year) / clip.path.name
 
 
-def build_plan(clips: list[Clip], output: Path) -> list[PlannedMove]:
+def build_plan(clips: list[Clip], output: Path, rename_duplicates: bool = False) -> list[PlannedMove]:
     """Mark existing and same-run name conflicts before any file is moved."""
-    destinations: dict[Path, int] = {}
+    if rename_duplicates:
+        reserved: set[str] = set()
+        plan: list[PlannedMove] = []
+        for clip in clips:
+            destination = get_destination(clip, output)
+            if destination.exists():
+                plan.append(PlannedMove(clip, destination, "CONFLICT: destination exists"))
+                continue
+            candidate = destination
+            number = 2
+            while path_key(candidate) in reserved or candidate.exists():
+                candidate = destination.parent / f"{destination.stem} ({number}){destination.suffix}"
+                number += 1
+            reserved.add(path_key(candidate))
+            plan.append(PlannedMove(clip, candidate, "READY"))
+        return plan
+
+    destinations: dict[str, int] = {}
     for clip in clips:
         destination = get_destination(clip, output)
-        destinations[destination] = destinations.get(destination, 0) + 1
+        key = path_key(destination)
+        destinations[key] = destinations.get(key, 0) + 1
     plan = []
     for clip in clips:
         destination = get_destination(clip, output)
         if destination.exists():
             status = "CONFLICT: destination exists"
-        elif destinations[destination] > 1:
+        elif destinations[path_key(destination)] > 1:
             status = "CONFLICT: duplicate destination in this run"
         else:
             status = "READY"
@@ -148,6 +288,7 @@ def print_plan(plan: list[PlannedMove]) -> None:
 def organize_clips(
     plan: list[PlannedMove],
     progress: Callable[[int, int, PlannedMove, str], None] | None = None,
+    on_moved: Callable[[Path, Path], None] | None = None,
     echo: bool = True,
 ) -> list[str]:
     messages = [
@@ -178,6 +319,8 @@ def organize_clips(
         else:
             message = f"MOVED: {move.clip.path.name}"
             messages.append(message)
+            if on_moved:
+                on_moved(move.clip.path, move.destination)
         if progress:
             progress(index, len(ready_moves), move, message)
     if echo:

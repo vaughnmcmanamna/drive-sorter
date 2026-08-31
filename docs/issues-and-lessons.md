@@ -43,3 +43,17 @@
 **Symptom:** A destination may be created after the move plan is built.
 
 **Resolution:** The organizer checks for an existing destination again immediately before each move and skips it if one exists.
+
+## Flatten destinations can also become stale
+
+**Symptom:** A file could appear at a planned flatten destination after confirmation.
+
+**Resolution:** Flattening now performs the same last-second destination check and selects a new numeric suffix rather than risking an overwrite.
+
+## The GUI launcher hid a runtime layout error
+
+**Symptom:** The `.pyw` launcher did not open a window after a layout change.
+
+**Cause:** Tkinter accepts a padding tuple for geometry managers but not for a frame's own `pady` option.
+
+**Resolution:** Replaced the invalid value and added a startup check that constructs and closes the GUI before handoff.

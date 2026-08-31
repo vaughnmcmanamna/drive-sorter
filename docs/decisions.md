@@ -32,6 +32,18 @@ The GUI uses a Windows 95-inspired native Tkinter design: classic gray panels, r
 
 ## Development workflow
 
-`dev_flatten_videos.py` is a development-only helper that moves nested test videos back to the root of `test-videos` after confirmation. It prevents overwrites by adding a numeric suffix when necessary and reports whether all moves succeeded.
+`dev_flatten_videos.py` provides shared flattening logic that moves nested videos back to the selected folder's root after confirmation. It prevents overwrites by adding a numeric suffix when necessary and reports whether all moves succeeded. The same behavior is available through the GUI's `Flatten all` button.
 
-**Why:** It makes it quick to rebuild a deliberately disorganized test folder without manually moving clips or deleting folders.
+**Why:** It makes it quick to rebuild a deliberately disorganized test folder without manually moving clips or deleting folders, while also giving users a safe way to undo the folder nesting created by an organization run.
+
+## Recovery and repeated scans
+
+Successful Organize and Flatten moves are recorded as the most recent operation and can be undone from the GUI. The metadata cache keys each entry to a file's absolute path, size, and modified timestamp; changed files are probed again.
+
+**Why:** File moves need a recovery route, while repeated scans should not repeatedly launch `ffprobe` for unchanged clips.
+
+## Visual hierarchy and advanced actions
+
+The normal workflow exposes only Browse, Scan, and Organize. Destination folders are the default scan result, while the full text plan is optional. Flattening, undo, and duplicate-name behavior are placed in a compact top-right flyout rather than competing with the main workflow.
+
+**Why:** The app is used for one repeated task. Giving every feature equal visual weight made the interface feel crowded and obscured the result users needed to review before organizing.
