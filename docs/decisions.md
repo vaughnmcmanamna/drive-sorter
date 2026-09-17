@@ -32,7 +32,7 @@ The GUI uses a Windows 95-inspired native Tkinter design: classic gray panels, r
 
 ## Development workflow
 
-`dev_flatten_videos.py` provides shared flattening logic that moves nested videos back to the selected folder's root after confirmation. It prevents overwrites by adding a numeric suffix when necessary and reports whether all moves succeeded. The same behavior is available through the GUI's `Flatten all` button.
+`flatten_videos.py` provides shared flattening logic that moves nested videos back to the selected folder's root after confirmation. It prevents overwrites by adding a numeric suffix when necessary and reports whether all moves succeeded. The same behavior is available through the GUI's `Flatten all` button.
 
 **Why:** It makes it quick to rebuild a deliberately disorganized test folder without manually moving clips or deleting folders, while also giving users a safe way to undo the folder nesting created by an organization run.
 
@@ -47,3 +47,45 @@ Successful Organize and Flatten moves are recorded as the most recent operation 
 The normal workflow exposes only Browse, Scan, and Organize. Destination folders are the default scan result, while the full text plan is optional. Flattening, undo, and duplicate-name behavior are placed in a compact top-right flyout rather than competing with the main workflow.
 
 **Why:** The app is used for one repeated task. Giving every feature equal visual weight made the interface feel crowded and obscured the result users needed to review before organizing.
+
+## Manual review of unknown clips
+
+Manual game assignments can happen before the first Organize action or later for clips already waiting in `Organized/Unsorted`. The review window shows a still frame, supports drag-to-game and button/keyboard assignment, and offers game folders already found by the scan or present under `Organized`.
+
+**Why:** This makes missing metadata fixable without weakening automatic detection or bypassing the preview, collision handling, last-second destination check, and undo journal.
+
+## Keyboard-first manual sorting
+
+The game list receives focus only after the review window is visible. Up/Down and Enter are the primary workflow; typing switches into filtered game-name entry. Mouse dragging and buttons remain available as equivalent controls.
+
+**Why:** Reviewing many clips should not require repeatedly moving between the preview and controls, and explicit post-map focus avoids a Windows/Tkinter issue where keyboard input was ignored until the first click.
+
+## Disposable versus canonical test clips
+
+Canonical metadata-free clips live under `test-fixtures`, while `tools/reset_test_fixtures.py` copies them into the ignored `test-videos` working directory.
+
+**Why:** Organizing a test clip consumes its source file. Keeping the only copy in the scanned directory made the repository lose its own fixtures after a successful test.
+
+## Empty-folder cleanup does not use Undo
+
+The advanced tools menu can preview and remove empty folders after one explicit confirmation. It removes deepest folders first, rechecks emptiness at deletion time, and skips the selected root, links, junctions, and changed folders. It does not replace the latest Organize or Flatten undo record.
+
+**Why:** No clip or other file is deleted, and the empty directories carry no contents to restore. A second undo mechanism would add complexity without improving recovery, while overwriting the move journal would make meaningful file recovery worse.
+
+## Plans belong to one selected folder
+
+Editing or browsing to a different folder immediately clears the existing scan and move plan. A fresh scan is required before Organize becomes available again.
+
+**Why:** Keeping a plan alive after the folder field changed made it possible to move old source clips while the interface appeared to target another folder.
+
+## Per-user application state
+
+Metadata cache and Undo history live in the current user's local application-data directory. Legacy state beside the source files remains readable and is migrated when new state is saved.
+
+**Why:** Installed application directories may be read-only. Cache and recovery data must remain writable without administrator permissions.
+
+## Open-source license
+
+Drive Sorter is released under the MIT License with Vaughn McManamna as the copyright holder. Bundled FFmpeg executables retain their separate GPLv3 terms and corresponding-source requirements.
+
+**Why:** MIT keeps the application easy to use, modify, redistribute, and incorporate elsewhere while requiring preservation of the copyright and license notice.

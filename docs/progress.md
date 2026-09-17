@@ -1,26 +1,38 @@
 # Current Progress
 
-- Core scanner, metadata reader, planner, and organizer are implemented
-- The GUI supports folder selection, scan and move progress, summaries, conflicts, and explicit completion states
-- Clips without usable metadata are sent to `Unsorted`
-- Destination conflicts and post-preview destination changes are skipped
-- `ffprobe` failures and timeouts are handled per file
-- Development flattening helper is available for rebuilding test scenarios
-- Automated tests cover metadata parsing, `ffprobe` timeout handling, scanner exclusion, planning conflicts, successful moves, progress reporting, and last-minute destination conflicts
-- A `.pyw` launcher starts the GUI without a terminal window
-- Custom Windows 95-style GUI emblem is included
-- GUI can safely flatten nested videos to the selected folder's top level, with confirmation and collision renaming
-- Scans use a four-worker metadata pool, persistent unchanged-file cache, and Cancel scan control
-- The latest Organize or Flatten operation can be undone safely from the GUI
-- Duplicate destination checks are Windows case-insensitive; optional safe renaming handles same-run duplicates
-- Production core module is named `organizer.py`
-- Move destinations are summarized as game folders with year subfolders and live per-folder progress
-- Large-folder movement animation is grouped by destination rather than playing once per clip
-- The interface now keeps Browse, Scan, and Organize as the primary workflow; advanced actions live in a compact top-right flyout
-- The complete text plan is hidden by default and can be opened with `+ Details`
-- The automated suite contains 20 tests, including cache, cancellation, stale-destination, rename, and undo flows
+## Complete
 
-## Next
+- Recursive video scanning with `Organized` exclusion
+- Concurrent FFprobe metadata reads with timeout handling
+- Persistent metadata cache for unchanged clips
+- Cooperative scan cancellation
+- Metadata-based game and creation-year detection
+- Safe Windows folder-name sanitization
+- Preview plans with destination summaries and optional full details
+- Case-insensitive duplicate detection
+- Optional safe numeric renaming for same-run and existing-file collisions
+- Background Organize and Flatten operations with progress reporting
+- Last-second destination checks before every move
+- Persistent undo journal for the latest successful Organize or Flatten operation
+- Windows 95-inspired Tkinter interface and custom application icon
+- Persistent `Organized/Unsorted` discovery after organizing or reopening a folder
+- Still-frame manual review with drag, buttons, typing, and keyboard-first Up/Down/Enter controls
+- Serialized FFmpeg preview extraction during rapid navigation
+- Canonical metadata-free fixtures and a disposable-fixture reset utility
+- Nonfatal handling for metadata-cache, individual metadata-reader, and unreadable-history failures
+- Confirmed, guarded removal of empty folders without replacing move history
+- Folder-change plan invalidation and guarded closing during active operations
+- Persistent Unsorted year refresh and final regular-file checks for all move workflows
+- Per-user cache and Undo storage with legacy-state migration
+- Empty production folder field with explicit selection required before scanning
+- Bundled-first FFmpeg/FFprobe discovery with missing-tool warnings
+- Reproducible PyInstaller portable build, Inno Setup installer, checksums, and GitHub release workflow
+- Automated suite of 43 unit and filesystem tests
+- Real Tkinter startup, initial-focus, keyboard-assignment, preview-throttling, and persistent-review smoke checks
 
-- Package the application with `ffprobe` availability checks for Windows distribution
-- Add a small GUI integration test that exercises scan, move, and undo with mocked metadata
+## Next candidates
+
+- Persist the selected source folder between launches
+- Add user-defined aliases for metadata titles that refer to the same game
+- Add an optional scrubber or multiple preview frames for clips whose first frame is not identifiable
+- Expand automated GUI coverage around the manual sorter and operation-history warnings

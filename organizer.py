@@ -14,10 +14,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from app_paths import LEGACY_STATE_DIRECTORY, STATE_DIRECTORY
+from media_tools import media_tool_path
+
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm", ".wmv"}
 FFPROBE_TIMEOUT_SECONDS = 30
 MAX_METADATA_WORKERS = 4
-METADATA_CACHE_PATH = Path(__file__).resolve().parent / ".drive-sorter-state" / "metadata-cache.json"
+METADATA_CACHE_PATH = STATE_DIRECTORY / "metadata-cache.json"
+LEGACY_METADATA_CACHE_PATH = LEGACY_STATE_DIRECTORY / "metadata-cache.json"
 INVALID_FOLDER_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 ZERO_WIDTH_CHARACTERS = re.compile(r"[\u200b-\u200d\ufeff]")
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
@@ -67,8 +71,15 @@ def path_key(path: Path) -> str:
 
 
 def _load_metadata_cache(cache_path: Path) -> dict[str, dict[str, object]]:
+    read_path = cache_path
+    if (
+        cache_path == METADATA_CACHE_PATH
+        and not cache_path.exists()
+        and LEGACY_METADATA_CACHE_PATH.exists()
+    ):
+        read_path = LEGACY_METADATA_CACHE_PATH
     try:
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        payload = json.loads(read_path.read_text(encoding="utf-8"))
         entries = payload.get("entries", {})
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
@@ -79,7 +90,10 @@ def _cached_clip(file: Path, entries: dict[str, dict[str, object]]) -> Clip | No
     entry = entries.get(str(file.resolve()))
     if not isinstance(entry, dict):
         return None
-    stat = file.stat()
+    try:
+        stat = file.stat()
+    except OSError:
+        return None
     if entry.get("size") != stat.st_size or entry.get("mtime_ns") != stat.st_mtime_ns:
         return None
     game = entry.get("game")
@@ -97,7 +111,10 @@ def _cached_clip(file: Path, entries: dict[str, dict[str, object]]) -> Clip | No
 def _cache_clip(file: Path, clip: Clip, entries: dict[str, dict[str, object]]) -> None:
     if clip.metadata_error not in (None, "no usable game title in metadata"):
         return
-    stat = file.stat()
+    try:
+        stat = file.stat()
+    except OSError:
+        return
     entries[str(file.resolve())] = {
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
@@ -108,10 +125,14 @@ def _cache_clip(file: Path, clip: Clip, entries: dict[str, dict[str, object]]) -
 
 
 def _save_metadata_cache(cache_path: Path, entries: dict[str, dict[str, object]]) -> None:
-    cache_path.parent.mkdir(exist_ok=True)
-    temporary_path = cache_path.with_suffix(".tmp")
-    temporary_path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
-    temporary_path.replace(cache_path)
+    try:
+        cache_path.parent.mkdir(exist_ok=True)
+        temporary_path = cache_path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        temporary_path.replace(cache_path)
+    except OSError:
+        # Caching is an optimization and must never turn a successful scan into a failure.
+        return
 
 
 def metadata_reader(file: Path) -> tuple[str | None, datetime | None, str | None]:
@@ -119,15 +140,18 @@ def metadata_reader(file: Path) -> tuple[str | None, datetime | None, str | None
     process_options: dict[str, int] = {}
     if os.name == "nt":
         process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+    ffprobe = media_tool_path("ffprobe")
+    if ffprobe is None:
+        return None, None, "ffprobe was not found; reinstall Drive Sorter"
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", str(file)],
+            [str(ffprobe), "-v", "error", "-print_format", "json", "-show_format", str(file)],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             timeout=FFPROBE_TIMEOUT_SECONDS,
             **process_options,
         )
     except FileNotFoundError:
-        return None, None, "ffprobe was not found on PATH"
+        return None, None, "ffprobe was not found; reinstall Drive Sorter"
     except OSError as error:
         return None, None, f"could not run ffprobe: {error}"
     except subprocess.TimeoutExpired:
@@ -213,7 +237,11 @@ def file_scanner(
                 raise ScanCancelled
             for future in finished:
                 index, file = pending.pop(future)
-                game, creation_time, error = future.result()
+                try:
+                    game, creation_time, error = future.result()
+                except Exception as unexpected_error:
+                    game, creation_time = None, None
+                    error = f"metadata read failed unexpectedly: {unexpected_error}"
                 clip = Clip(file, game, creation_time.year if creation_time else None, error)
                 results[index] = clip
                 if cache_path:
@@ -236,6 +264,68 @@ def get_destination(clip: Clip, output: Path) -> Path:
     return output / clip.game / str(clip.year) / clip.path.name
 
 
+def classify_clip(clip: Clip, game: str) -> Clip:
+    """Return a manually classified clip after applying folder-name safety rules."""
+    cleaned_game = sanitize_folder_name(game)
+    if cleaned_game is None:
+        raise ValueError("Enter a usable game name.")
+    return Clip(clip.path, cleaned_game, clip.year, None)
+
+
+def known_games(clips: list[Clip], output: Path) -> list[str]:
+    """List safe game choices found in the scan and existing Organized folders."""
+    games: dict[str, str] = {}
+    for clip in clips:
+        if clip.game:
+            games.setdefault(clip.game.casefold(), clip.game)
+    try:
+        for folder in output.iterdir():
+            if folder.is_dir() and folder.name.casefold() != "unsorted":
+                game = sanitize_folder_name(folder.name)
+                if game:
+                    games.setdefault(game.casefold(), game)
+    except OSError:
+        pass
+    return sorted(games.values(), key=str.casefold)
+
+
+def find_unsorted_videos(output: Path) -> list[Path]:
+    """Return video files already waiting in Organized/Unsorted."""
+    unsorted = output / "Unsorted"
+    try:
+        files = [
+            file for file in unsorted.rglob("*")
+            if file.is_file() and file.suffix.lower() in VIDEO_EXTENSIONS
+        ]
+    except OSError:
+        return []
+    return sorted(files, key=lambda file: str(file).casefold())
+
+
+def refresh_missing_years(clips: list[Clip], workers: int | None = None) -> list[Clip]:
+    """Read metadata years for persistent Unsorted clips without changing their games."""
+    missing = [(index, clip) for index, clip in enumerate(clips) if clip.year is None]
+    if not missing:
+        return list(clips)
+    refreshed = list(clips)
+    worker_count = workers if workers is not None else min(MAX_METADATA_WORKERS, len(missing))
+    with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
+        futures = {
+            executor.submit(metadata_reader, clip.path): (index, clip)
+            for index, clip in missing
+        }
+        for future, (index, clip) in futures.items():
+            try:
+                _game, creation_time, _error = future.result()
+            except Exception:
+                continue
+            if creation_time is not None:
+                refreshed[index] = Clip(
+                    clip.path, clip.game, creation_time.year, clip.metadata_error
+                )
+    return refreshed
+
+
 def build_plan(clips: list[Clip], output: Path, rename_duplicates: bool = False) -> list[PlannedMove]:
     """Mark existing and same-run name conflicts before any file is moved."""
     if rename_duplicates:
@@ -243,9 +333,6 @@ def build_plan(clips: list[Clip], output: Path, rename_duplicates: bool = False)
         plan: list[PlannedMove] = []
         for clip in clips:
             destination = get_destination(clip, output)
-            if destination.exists():
-                plan.append(PlannedMove(clip, destination, "CONFLICT: destination exists"))
-                continue
             candidate = destination
             number = 2
             while path_key(candidate) in reserved or candidate.exists():
@@ -298,6 +385,12 @@ def organize_clips(
     ]
     ready_moves = [move for move in plan if move.status == "READY"]
     for index, move in enumerate(ready_moves, start=1):
+        if not move.clip.path.is_file() or move.clip.path.is_symlink():
+            message = f"SKIPPED: {move.clip.path.name} (source is no longer a regular file)"
+            messages.append(message)
+            if progress:
+                progress(index, len(ready_moves), move, message)
+            continue
         if move.destination.exists():
             message = f"SKIPPED: {move.clip.path.name} (destination now exists)"
             messages.append(message)

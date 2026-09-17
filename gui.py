@@ -10,8 +10,21 @@ from queue import Empty, Queue
 from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
-from dev_flatten_videos import build_flatten_plan, flatten_videos
-from organizer import Clip, ScanCancelled, PlannedMove, build_plan, file_scanner, organize_clips
+from flatten_videos import build_flatten_plan, flatten_videos
+from empty_folders import build_empty_folder_plan, remove_empty_folders
+from manual_sorter import review_unsorted
+from media_tools import missing_media_tools
+from organizer import (
+    Clip,
+    PlannedMove,
+    ScanCancelled,
+    build_plan,
+    file_scanner,
+    find_unsorted_videos,
+    known_games,
+    organize_clips,
+    refresh_missing_years,
+)
 from operation_history import MoveRecord, load_last_operation, save_last_operation, undo_last_operation
 
 
@@ -19,11 +32,12 @@ BACKGROUND = "#c0c0c0"
 PANEL = "#ffffff"
 TEXT = "#000000"
 BLACK = "#000000"
-MUTED = "#404040"
+MUTED = "#202020"
 ACCENT = "#000080"
 WARNING = "#804000"
 ERROR = "#800000"
 FONT = ("MS Sans Serif", 10)
+FONT_BOLD = ("MS Sans Serif", 10, "bold")
 
 
 class DriveSorterApp(tk.Tk):
@@ -39,8 +53,7 @@ class DriveSorterApp(tk.Tk):
         self.header_icon = self.app_icon.subsample(32, 32)
         self.iconphoto(True, self.app_icon)
 
-        default_directory = Path(__file__).resolve().parent / "test-videos"
-        self.directory = tk.StringVar(value=str(default_directory))
+        self.directory = tk.StringVar(value="")
         self.status = tk.StringVar(value="Choose a folder, then scan it.")
         self.signal = tk.StringVar(value="[ READY TO SCAN ]")
         self.progress_value = tk.DoubleVar(value=0)
@@ -49,10 +62,13 @@ class DriveSorterApp(tk.Tk):
         self.plan: list[PlannedMove] = []
         self.scanned_clips: list[Clip] = []
         self.flatten_plan: list[tuple[Path, Path]] = []
+        self.empty_folder_plan: list[Path] = []
+        self.empty_folder_root: Path | None = None
         self.scanned_folder: Path | None = None
         self.events: Queue[tuple[str, object]] = Queue()
         self.cancel_requested = threading.Event()
         self.active_operation: str | None = None
+        self.history_save_failed = False
         self.animation_queue: list[tuple[Path, int]] = []
         self.animation_job: str | None = None
         self.animated_destinations: set[Path] = set()
@@ -68,7 +84,14 @@ class DriveSorterApp(tk.Tk):
             darkcolor=ACCENT, thickness=16,
         )
         self._build_interface()
+        self._last_directory_text = self.directory.get()
+        self.directory.trace_add("write", self._directory_text_changed)
+        self.folder_entry.bind("<Return>", self._finish_folder_edit)
+        self.folder_entry.bind("<FocusOut>", self._finish_folder_edit)
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
         self._refresh_undo_button()
+        self._refresh_review_button()
+        self.after(250, self._check_media_tools)
 
     def _build_interface(self) -> None:
         header = tk.Frame(self, bg=ACCENT, padx=6, pady=4, relief="raised", bd=2)
@@ -91,10 +114,10 @@ class DriveSorterApp(tk.Tk):
         controls.pack(fill="x")
         row = tk.Frame(controls, bg=BACKGROUND)
         row.pack(fill="x")
-        tk.Label(row, text="Folder:", bg=BACKGROUND, fg=TEXT, font=FONT).pack(side="left", padx=(0, 6))
+        tk.Label(row, text="Folder:", bg=BACKGROUND, fg=TEXT, font=FONT_BOLD).pack(side="left", padx=(0, 6))
         self.folder_entry = tk.Entry(
             row, textvariable=self.directory, bg=PANEL, fg=TEXT, insertbackground=TEXT,
-            relief="sunken", bd=2, highlightthickness=0, font=FONT,
+            relief="sunken", bd=2, highlightthickness=0, font=FONT_BOLD,
         )
         self.folder_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.browse_button = self._button(row, "Browse", self.choose_folder)
@@ -106,12 +129,15 @@ class DriveSorterApp(tk.Tk):
         self.organize_button = self._button(actions, "Organize", self.organize)
         self.organize_button.pack(side="left", padx=(8, 0))
         self.organize_button.configure(state="disabled")
+        self.review_button = self._button(actions, "Review unsorted", self.review_unsorted)
+        self.review_button.pack(side="left", padx=(8, 0))
+        self.review_button.configure(state="disabled")
         self.progress = ttk.Progressbar(
             controls, mode="determinate", maximum=1, variable=self.progress_value,
             style="DriveSorter.Horizontal.TProgressbar",
         )
         self.move_animation = tk.Canvas(
-            controls, height=48, bg="#ffffff", relief="sunken", bd=2,
+            controls, height=92, bg="#ffffff", relief="sunken", bd=2,
             highlightthickness=0,
         )
         self._draw_animation_idle("Waiting for a move plan")
@@ -132,6 +158,11 @@ class DriveSorterApp(tk.Tk):
         tools_content.pack(fill="x")
         self.flatten_button = self._sidebar_action(tools_content, "Flatten all", self.flatten)
         self.flatten_button.pack(fill="x")
+        self._sidebar_divider(tools_content).pack(fill="x")
+        self.empty_folders_button = self._sidebar_action(
+            tools_content, "Remove empty folders", self.clean_empty_folders
+        )
+        self.empty_folders_button.pack(fill="x")
         self._sidebar_divider(tools_content).pack(fill="x")
         self.undo_button = self._sidebar_action(tools_content, "Undo last", self.undo_last)
         self.undo_button.pack(fill="x")
@@ -188,15 +219,15 @@ class DriveSorterApp(tk.Tk):
     def _button(self, parent: tk.Misc, text: str, command: object) -> tk.Button:
         return tk.Button(
             parent, text=text, command=command, bg=BACKGROUND, fg=TEXT,
-            activebackground=BACKGROUND, activeforeground=TEXT, disabledforeground="#808080",
-            relief="raised", bd=2, padx=10, pady=4, font=FONT,
+            activebackground=BACKGROUND, activeforeground=TEXT, disabledforeground="#606060",
+            relief="raised", bd=2, padx=10, pady=4, font=FONT_BOLD,
         )
 
     def _small_button(self, parent: tk.Misc, text: str, command: object) -> tk.Button:
         return tk.Button(
             parent, text=text, command=command, bg=BACKGROUND, fg=MUTED,
-            activebackground=BACKGROUND, activeforeground=TEXT, disabledforeground="#808080",
-            relief="raised", bd=2, padx=6, pady=1, font=("MS Sans Serif", 8),
+            activebackground=BACKGROUND, activeforeground=TEXT, disabledforeground="#606060",
+            relief="raised", bd=2, padx=6, pady=1, font=("MS Sans Serif", 8, "bold"),
         )
 
     def _sidebar_action(self, parent: tk.Misc, text: str, command: object) -> tk.Button:
@@ -206,8 +237,8 @@ class DriveSorterApp(tk.Tk):
 
         return tk.Button(
             parent, text=text, command=choose, bg=BACKGROUND, fg=TEXT,
-            activebackground="#a0a0a0", activeforeground=TEXT, disabledforeground="#808080",
-            relief="flat", bd=0, highlightthickness=0, anchor="w", padx=8, pady=8, font=FONT,
+            activebackground="#a0a0a0", activeforeground=TEXT, disabledforeground="#606060",
+            relief="flat", bd=0, highlightthickness=0, anchor="w", padx=8, pady=8, font=FONT_BOLD,
         )
 
     @staticmethod
@@ -257,7 +288,7 @@ class DriveSorterApp(tk.Tk):
 
         body = tk.Frame(dialog, bg=BACKGROUND, padx=16, pady=16)
         body.pack(fill="both", expand=True)
-        tk.Label(body, text=message, bg=BACKGROUND, fg=TEXT, justify="left", anchor="w", wraplength=460, font=FONT).pack(fill="x")
+        tk.Label(body, text=message, bg=BACKGROUND, fg=TEXT, justify="left", anchor="w", wraplength=460, font=FONT_BOLD).pack(fill="x")
         tk.Frame(body, bg="#808080", height=2).pack(fill="x", pady=(16, 10))
         buttons = tk.Frame(body, bg=BACKGROUND)
         buttons.pack(anchor="e")
@@ -289,6 +320,73 @@ class DriveSorterApp(tk.Tk):
         chosen = filedialog.askdirectory(parent=self, initialdir=self.directory.get() or None)
         if chosen:
             self.directory.set(chosen)
+            self._refresh_review_button()
+
+    def _selected_folder(self) -> Path | None:
+        value = self.directory.get().strip()
+        return Path(value).expanduser() if value else None
+
+    def _require_selected_folder(self) -> Path | None:
+        folder = self._selected_folder()
+        if folder is None:
+            messagebox.showinfo(
+                "Drive Sorter", "Choose a folder first.", parent=self
+            )
+            return None
+        if not folder.is_dir():
+            messagebox.showerror(
+                "Drive Sorter", f"This is not a folder:\n{folder}", parent=self
+            )
+            return None
+        return folder
+
+    def _directory_text_changed(self, *_args: object) -> None:
+        """Invalidate plans immediately when the selected folder text changes."""
+        current_text = self.directory.get()
+        if current_text == self._last_directory_text:
+            return
+        self._last_directory_text = current_text
+        self.plan = []
+        self.scanned_clips = []
+        self.flatten_plan = []
+        self.empty_folder_plan = []
+        self.empty_folder_root = None
+        self.scanned_folder = None
+        self.organize_button.configure(state="disabled")
+        self.review_button.configure(text="Review unsorted", state="disabled")
+        self.clear_output()
+        self._reset_animation("Scan the selected folder to build a move plan")
+        self._set_signal("[ READY TO SCAN ]", ACCENT)
+        self.status.set("Folder changed. Scan it before organizing clips.")
+
+    def _finish_folder_edit(self, _event: object = None) -> None:
+        """Discover persistent Unsorted clips after a typed path is committed."""
+        if self.active_operation is None:
+            self._refresh_review_button()
+
+    def _request_close(self) -> None:
+        """Do not abandon a file operation before its result and history are saved."""
+        if self.active_operation is not None:
+            messagebox.showwarning(
+                "Drive Sorter",
+                "Drive Sorter is still working. Wait for the current operation to finish before closing.",
+                parent=self,
+            )
+            return
+        self.destroy()
+
+    def _check_media_tools(self) -> None:
+        missing = missing_media_tools()
+        if not missing:
+            return
+        names = " and ".join(name + ".exe" for name in missing)
+        messagebox.showwarning(
+            "Drive Sorter installation incomplete",
+            f"Drive Sorter could not find {names}.\n\n"
+            "Game detection and clip previews may not work. Reinstall Drive Sorter "
+            "or install FFmpeg and make it available on PATH.",
+            parent=self,
+        )
 
     def write(self, text: str, tag: str | None = None) -> None:
         self.output.configure(state="normal")
@@ -441,7 +539,9 @@ class DriveSorterApp(tk.Tk):
         tools_state = "normal" if busy and self.active_operation == "scan" else state
         self.tools_button.configure(state=tools_state)
         self.flatten_button.configure(state=state)
-        self.undo_button.configure(state="disabled" if busy or not load_last_operation() else "normal")
+        self.empty_folders_button.configure(state=state)
+        undo_available = not self.history_save_failed and load_last_operation() is not None
+        self.undo_button.configure(state="disabled" if busy or not undo_available else "normal")
         self.rename_toggle.configure(state=state)
         if busy and self.active_operation == "scan":
             if not self.cancel_button.winfo_manager():
@@ -453,17 +553,72 @@ class DriveSorterApp(tk.Tk):
             self.cancel_button.pack_forget()
         if busy:
             self.organize_button.configure(state="disabled")
+            self.review_button.configure(state="disabled")
         else:
             self._hide_progress()
             self.active_operation = None
+            self._refresh_review_button()
 
     def _refresh_undo_button(self) -> None:
-        self.undo_button.configure(state="normal" if load_last_operation() else "disabled")
+        available = not self.history_save_failed and load_last_operation() is not None
+        self.undo_button.configure(state="normal" if available else "disabled")
+
+    def _save_operation_history(self, operation: str, moves: list[MoveRecord]) -> None:
+        if not moves:
+            return
+        try:
+            save_last_operation(operation, moves)
+        except OSError as error:
+            self.history_save_failed = True
+            self.write(f"\nWARNING: Undo history could not be saved ({error})\n", "warning")
+            self.status.set(self.status.get() + " Undo is unavailable for this operation.")
+        else:
+            self.history_save_failed = False
+
+    def _review_candidates(self) -> list[Clip]:
+        selected_folder = self._selected_folder()
+        if selected_folder is None or not selected_folder.is_dir():
+            return []
+        output = selected_folder / "Organized"
+        candidates = {
+            clip.path: clip
+            for clip in self.scanned_clips
+            if clip.game is None and clip.path.exists()
+        }
+        previous_years = {
+            move.destination: move.clip.year
+            for move in self.plan
+            if move.clip.game is None
+        }
+        for path in find_unsorted_videos(output):
+            candidates.setdefault(
+                path,
+                Clip(path, None, previous_years.get(path), "waiting for manual review"),
+            )
+        pending = {
+            move.clip.path
+            for move in self.plan
+            if move.clip.game is not None and move.clip.path.is_relative_to(output / "Unsorted")
+        }
+        return [
+            clip for path, clip in sorted(candidates.items(), key=lambda item: str(item[0]).casefold())
+            if path not in pending
+        ]
+
+    def _refresh_review_button(self) -> None:
+        if self.active_operation is not None:
+            self.review_button.configure(state="disabled")
+            return
+        count = len(self._review_candidates())
+        self.review_button.configure(
+            text=f"Review unsorted ({count})" if count else "Review unsorted",
+            state="normal" if count else "disabled",
+        )
 
     def _draw_animation_idle(self, message: str) -> None:
         self.move_animation.delete("all")
         self.move_animation.create_text(
-            8, 23, anchor="w", text=message, fill=MUTED, font=FONT
+            8, 45, anchor="w", text=message, fill=MUTED, font=FONT
         )
 
     def _show_animation(self) -> None:
@@ -501,9 +656,9 @@ class DriveSorterApp(tk.Tk):
         canvas = self.move_animation
         canvas.delete("all")
         width = max(canvas.winfo_width(), 700)
-        folder_left = width - 115
+        folder_left = width - 125
         start_left = 16
-        target_left = folder_left - 54
+        target_left = folder_left - 62
         progress = min(self.animation_step / 12, 1)
         clip_left = start_left + (target_left - start_left) * progress
         if self.animation_destination.name == "Unsorted":
@@ -513,18 +668,29 @@ class DriveSorterApp(tk.Tk):
 
         canvas.create_text(
             8, 8, anchor="nw", text=f"Sending {self.animation_clip_count} clip(s)",
-            fill=MUTED, font=("MS Sans Serif", 8),
+            fill=MUTED, font=("MS Sans Serif", 8, "bold"),
         )
         for offset in (8, 4, 0):
-            canvas.create_rectangle(clip_left + offset, 20 - offset // 2, clip_left + 48 + offset, 39 - offset // 2, fill="#000080", outline=BLACK)
-        canvas.create_rectangle(clip_left + 5, 24, clip_left + 25, 27, fill="#ffffff", outline="")
-        canvas.create_text(clip_left + 36, 29, text="MP4", fill="#ffffff", font=("MS Sans Serif", 7, "bold"))
+            canvas.create_rectangle(clip_left + offset, 30 - offset // 2, clip_left + 48 + offset, 49 - offset // 2, fill="#000080", outline=BLACK)
+        canvas.create_rectangle(clip_left + 5, 34, clip_left + 25, 37, fill="#ffffff", outline="")
+        canvas.create_text(clip_left + 36, 39, text="MP4", fill="#ffffff", font=("MS Sans Serif", 7, "bold"))
+
+        # A full-size classic folder with a separate label below it.
         canvas.create_polygon(
-            folder_left, 18, folder_left + 27, 18, folder_left + 34, 24,
-            folder_left + 78, 24, folder_left + 78, 40, folder_left, 40,
+            folder_left, 14, folder_left + 34, 14, folder_left + 42, 22,
+            folder_left + 92, 22, folder_left + 92, 58, folder_left, 58,
             fill="#ffff00", outline=BLACK,
         )
-        canvas.create_text(folder_left + 39, 45, text=folder_name[:28], anchor="s", fill=TEXT, font=("MS Sans Serif", 7))
+        canvas.create_polygon(
+            folder_left + 3, 29, folder_left + 89, 29,
+            folder_left + 84, 55, folder_left + 8, 55,
+            fill="#e6c800", outline=BLACK,
+        )
+        canvas.create_line(folder_left + 5, 31, folder_left + 86, 31, fill="#ffffff")
+        canvas.create_text(
+            folder_left + 46, 64, text=folder_name, anchor="n", width=150,
+            justify="center", fill=TEXT, font=("MS Sans Serif", 8, "bold"),
+        )
 
         if self.animation_step < 12:
             self.animation_step += 1
@@ -533,9 +699,8 @@ class DriveSorterApp(tk.Tk):
             self.animation_job = self.after(90, self._play_next_animation)
 
     def scan(self) -> None:
-        folder = Path(self.directory.get()).expanduser()
-        if not folder.is_dir():
-            messagebox.showerror("Drive Sorter", f"This is not a folder:\n{folder}", parent=self)
+        folder = self._require_selected_folder()
+        if folder is None:
             return
         self.plan = []
         self.scanned_clips = []
@@ -613,6 +778,20 @@ class DriveSorterApp(tk.Tk):
                 elif event == "flatten_complete":
                     self._show_flatten_result(payload)
                     finished = True
+                elif event == "empty_folder_plan":
+                    self._show_empty_folder_plan(payload)
+                    finished = True
+                elif event == "empty_folder_progress":
+                    completed, total, folder, _message = payload
+                    self.progress.configure(maximum=max(total, 1))
+                    self.progress_value.set(completed)
+                    self.status.set(f"Removing empty folders: {completed}/{total} - {folder.name}")
+                elif event == "empty_folder_complete":
+                    self._show_empty_folder_result(payload)
+                    finished = True
+                elif event == "review_ready":
+                    self._show_review_ready(payload)
+                    finished = True
                 elif event == "undo_complete":
                     self._show_undo_result(payload)
                     finished = True
@@ -625,11 +804,15 @@ class DriveSorterApp(tk.Tk):
             self.after(75, self._poll_events)
 
     def _show_failure(self, error: str) -> None:
+        failed_operation = self.active_operation
         self.write(f"FAILED: {error}\n", "error")
         self._set_signal("[ OPERATION FAILED ]", ERROR)
         self.status.set("Operation failed. Nothing else was attempted.")
         self._set_busy(False)
-        self.organize_button.configure(state="disabled")
+        ready = failed_operation in {"empty_folders", "review_metadata"} and any(
+            move.status == "READY" for move in self.plan
+        )
+        self.organize_button.configure(state="normal" if ready else "disabled")
 
     def cancel_scan(self) -> None:
         if self.active_operation != "scan":
@@ -654,7 +837,12 @@ class DriveSorterApp(tk.Tk):
 
     def _show_plan(self, clips: list[Clip]) -> None:
         self.scanned_clips = clips
-        output = (self.scanned_folder or Path(self.directory.get()).expanduser()) / "Organized"
+        selected_folder = self.scanned_folder or self._selected_folder()
+        if selected_folder is None:
+            self._show_failure("The selected folder is no longer available.")
+            return
+        self.scanned_folder = selected_folder
+        output = selected_folder / "Organized"
         plan = build_plan(clips, output, rename_duplicates=self.rename_duplicates.get())
         self.plan = plan
         self.show_destination_progress = False
@@ -694,6 +882,65 @@ class DriveSorterApp(tk.Tk):
         self.progress_value.set(len(plan))
         self._set_busy(False)
         self.organize_button.configure(state="normal" if ready else "disabled")
+        self._refresh_review_button()
+
+    def review_unsorted(self) -> None:
+        """Let the user classify missing-metadata clips before the move confirmation."""
+        unsorted = self._review_candidates()
+        if not unsorted:
+            self._refresh_review_button()
+            return
+        selected_folder = self._require_selected_folder()
+        if selected_folder is None:
+            return
+        self.scanned_folder = selected_folder
+        self.events = Queue()
+        self.active_operation = "review_metadata"
+        self._show_progress()
+        self.progress.configure(maximum=1)
+        self.progress_value.set(0)
+        self._set_signal("[ PREPARING REVIEW ]", MUTED)
+        self.status.set("Refreshing clip dates before manual review...")
+        self._set_busy(True)
+        threading.Thread(
+            target=self._review_metadata_worker, args=(unsorted,), daemon=True
+        ).start()
+        self.after(75, self._poll_events)
+
+    def _review_metadata_worker(self, clips: list[Clip]) -> None:
+        try:
+            self.events.put(("review_ready", refresh_missing_years(clips)))
+        except Exception as error:
+            self.events.put(("failed", str(error)))
+
+    def _show_review_ready(self, unsorted: list[Clip]) -> None:
+        self._set_busy(False)
+        if not unsorted:
+            self._refresh_review_button()
+            return
+        selected_folder = self.scanned_folder or self._selected_folder()
+        if selected_folder is None:
+            self._show_failure("The selected folder is no longer available.")
+            return
+        self.scanned_folder = selected_folder
+        output = selected_folder / "Organized"
+        assignments = review_unsorted(
+            self, unsorted, known_games(self.scanned_clips, output), self.app_icon
+        )
+        if assignments:
+            current_sources = [
+                clip for clip in self.scanned_clips
+                if clip.path.exists() and not clip.path.is_relative_to(output)
+            ]
+            self.scanned_clips = [
+                assignments.get(clip.path, clip) for clip in current_sources
+            ] + [
+                clip for path, clip in assignments.items()
+                if path not in {source.path for source in current_sources}
+            ]
+            self._show_plan(self.scanned_clips)
+        else:
+            self._refresh_review_button()
 
     def organize(self) -> None:
         ready = sum(move.status == "READY" for move in self.plan)
@@ -740,9 +987,8 @@ class DriveSorterApp(tk.Tk):
         self.after(75, self._poll_events)
 
     def flatten(self) -> None:
-        folder = Path(self.directory.get()).expanduser()
-        if not folder.is_dir():
-            messagebox.showerror("Drive Sorter", f"This is not a folder:\n{folder}", parent=self)
+        folder = self._require_selected_folder()
+        if folder is None:
             return
         self.events = Queue()
         self.active_operation = "flatten"
@@ -840,10 +1086,116 @@ class DriveSorterApp(tk.Tk):
         self.plan = []
         self.scanned_clips = []
         self._set_busy(False)
-        if moves:
-            save_last_operation("flatten", moves)
+        self._save_operation_history("flatten", moves)
         self._refresh_undo_button()
         self.organize_button.configure(state="disabled")
+
+    def clean_empty_folders(self) -> None:
+        folder = self._require_selected_folder()
+        if folder is None:
+            return
+        self.empty_folder_root = folder.resolve()
+        self.events = Queue()
+        self.active_operation = "empty_folders"
+        self._show_progress()
+        self.progress.configure(maximum=1)
+        self.progress_value.set(0)
+        self._set_signal("[ CHECKING EMPTY FOLDERS ]", MUTED)
+        self.status.set("Finding empty folders...")
+        self._set_busy(True)
+        threading.Thread(
+            target=self._empty_folder_plan_worker,
+            args=(self.empty_folder_root,),
+            daemon=True,
+        ).start()
+        self.after(75, self._poll_events)
+
+    def _empty_folder_plan_worker(self, folder: Path) -> None:
+        try:
+            self.events.put(("empty_folder_plan", build_empty_folder_plan(folder)))
+        except Exception as error:
+            self.events.put(("failed", str(error)))
+
+    def _show_empty_folder_plan(self, plan: list[Path]) -> None:
+        self.empty_folder_plan = plan
+        root = self.empty_folder_root
+        self._set_busy(False)
+        ready = any(move.status == "READY" for move in self.plan)
+        self.organize_button.configure(state="normal" if ready else "disabled")
+        if not plan or root is None:
+            self._set_signal("[ NO EMPTY FOLDERS ]", MUTED)
+            self.status.set("No empty folders found beneath the selected folder.")
+            return
+
+        # Keep any current scan summary and destination cards intact. Cleanup
+        # does not invalidate a move plan because Organizer recreates its
+        # destination directories when needed.
+        self.write("\nEMPTY FOLDER PLAN\n\n", "muted")
+        self.write(f"{len(plan)} empty folder(s) can be removed.\n\n", "ready")
+        for folder in plan:
+            self.write(f"{folder.relative_to(root)}\n", "muted")
+
+        examples = [str(folder.relative_to(root)) for folder in plan[:6]]
+        preview = "\n".join(f"- {name}" for name in examples)
+        if len(plan) > len(examples):
+            preview += f"\n- ...and {len(plan) - len(examples)} more"
+        if not self._confirm(
+            "Confirm empty-folder cleanup",
+            f"Remove {len(plan)} empty folder(s)?\n\n{preview}\n\n"
+            "Files and non-empty folders will not be changed.",
+            "Remove folders",
+        ):
+            self._set_signal("[ CLEANUP CANCELLED ]", MUTED)
+            self.status.set("Empty-folder cleanup cancelled. Nothing was removed.")
+            return
+        self._start_empty_folder_cleanup()
+
+    def _start_empty_folder_cleanup(self) -> None:
+        self.events = Queue()
+        self.active_operation = "empty_folders"
+        self._show_progress()
+        self.progress.configure(maximum=max(len(self.empty_folder_plan), 1))
+        self.progress_value.set(0)
+        self._set_signal("[ REMOVING EMPTY FOLDERS ]", WARNING)
+        self.status.set("Removing empty folders...")
+        self._set_busy(True)
+        threading.Thread(target=self._empty_folder_worker, daemon=True).start()
+        self.after(75, self._poll_events)
+
+    def _empty_folder_worker(self) -> None:
+        try:
+            root = self.empty_folder_root
+            if root is None:
+                raise RuntimeError("The selected folder is no longer available.")
+            messages = remove_empty_folders(root, self.empty_folder_plan, self._report_empty_folder_progress)
+            self.events.put(("empty_folder_complete", messages))
+        except Exception as error:
+            self.events.put(("failed", str(error)))
+
+    def _report_empty_folder_progress(
+        self, completed: int, total: int, folder: Path, message: str
+    ) -> None:
+        self.events.put(("empty_folder_progress", (completed, total, folder, message)))
+
+    def _show_empty_folder_result(self, messages: list[str]) -> None:
+        removed = sum(message.startswith("REMOVED") for message in messages)
+        skipped = len(messages) - removed
+        self.write("\nEMPTY FOLDER RESULT\n", "muted")
+        for message in messages:
+            if message.startswith("SKIPPED"):
+                self.write(f"{message}\n", "warning")
+        if skipped:
+            summary = f"CLEANUP COMPLETE: {removed} removed, {skipped} safely skipped"
+            self._set_signal("[ CLEANUP COMPLETE WITH SKIPS ]", WARNING)
+        else:
+            summary = f"CLEANUP COMPLETE: {removed} empty folder(s) removed"
+            self._set_signal("[ CLEANUP COMPLETE ]", ACCENT)
+        self.write(f"\n{summary}\n", "ready" if not skipped else "warning")
+        self.status.set(summary + ".")
+        self.empty_folder_plan = []
+        self._set_busy(False)
+        ready = any(move.status == "READY" for move in self.plan)
+        self.organize_button.configure(state="normal" if ready else "disabled")
 
     def _move_worker(self) -> None:
         try:
@@ -879,9 +1231,26 @@ class DriveSorterApp(tk.Tk):
         self.status.set(summary + ". Scan again to refresh the plan.")
         if not moved:
             self._draw_animation_idle("No clips were moved")
+        moved_destinations = {move.source: move.destination for move in moves}
+        selected_folder = self.scanned_folder or self._selected_folder()
+        unsorted_folder = selected_folder / "Organized" / "Unsorted" if selected_folder else None
+        refreshed_clips: list[Clip] = []
+        for clip in self.scanned_clips:
+            current_path = moved_destinations.get(clip.path, clip.path)
+            if not current_path.exists():
+                continue
+            if unsorted_folder is not None and current_path.is_relative_to(unsorted_folder):
+                refreshed_clips.append(
+                    Clip(current_path, None, clip.year, "waiting for manual review")
+                )
+            else:
+                refreshed_clips.append(
+                    Clip(current_path, clip.game, clip.year, clip.metadata_error)
+                )
+        self.scanned_clips = refreshed_clips
+        self.plan = []
         self._set_busy(False)
-        if moves:
-            save_last_operation("organize", moves)
+        self._save_operation_history("organize", moves)
         self._refresh_undo_button()
         self.organize_button.configure(state="disabled")
 

@@ -57,3 +57,47 @@
 **Cause:** Tkinter accepts a padding tuple for geometry managers but not for a frame's own `pady` option.
 
 **Resolution:** Replaced the invalid value and added a startup check that constructs and closes the GUI before handoff.
+
+## Manual review disappeared after organizing
+
+**Symptom:** Unknown clips moved into `Organized/Unsorted`, but the Review unsorted button became disabled.
+
+**Cause:** The button count was derived only from the pre-move in-memory scan.
+
+**Resolution:** Review candidates now combine current unknown clips with video files physically present in `Organized/Unsorted`. Failed or skipped follow-up moves are reconciled back into that review state.
+
+## Keyboard controls required an initial mouse click
+
+**Symptom:** Up/Down and Enter worked only after clicking inside the manual sorter.
+
+**Cause:** Tkinter received the focus request before Windows had finished mapping the modal window.
+
+**Resolution:** The dialog now waits until it is visible, raises itself, establishes its modal grab, and then explicitly focuses the game list. Dialog-level fallback bindings cover unexpected focus placement.
+
+## Rapid review created too many preview jobs
+
+**Symptom:** Quickly skipping clips could start one FFmpeg process per visited clip.
+
+**Cause:** Every navigation action created an independent preview thread.
+
+**Resolution:** Preview work is serialized. One extraction may run while only the newest requested preview waits.
+
+## Test clips disappeared after successful use
+
+**Symptom:** Running Organize removed the manual-review fixtures from their test directory.
+
+**Cause:** The test directory contained the canonical copies, and moving source files is the application's intended behavior.
+
+**Resolution:** Canonical clips now live under `test-fixtures`; a reset utility creates disposable copies under `test-videos`.
+
+## Optional duplicate renaming ignored existing files
+
+**Symptom:** Duplicate renaming handled two clips in one plan but still marked an already-existing destination as a conflict.
+
+**Resolution:** Rename mode now finds a safe numeric suffix for both same-run and on-disk collisions.
+
+## Nonessential state failures interrupted successful work
+
+**Symptom:** A disappearing file, an unwritable metadata cache, or unreadable history could fail a larger operation.
+
+**Resolution:** Unexpected metadata errors remain per-file notes, cache failures are nonfatal, unreadable history is treated as unavailable, and history-save failures produce a visible warning while disabling misleading Undo controls.

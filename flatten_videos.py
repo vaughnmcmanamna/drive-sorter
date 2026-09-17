@@ -1,4 +1,4 @@
-"""Development helper: move nested videos back to the top of a test folder."""
+"""Safely move nested videos back to the top of a selected folder."""
 
 from __future__ import annotations
 
@@ -45,6 +45,12 @@ def flatten_videos(
     messages = []
     reserved = {path_key(destination) for _source, destination in plan}
     for index, (source, destination) in enumerate(plan, start=1):
+        if not source.is_file() or source.is_symlink():
+            message = f"SKIPPED: {source.name} (source is no longer a regular file)"
+            messages.append(message)
+            if progress:
+                progress(index, len(plan), source, destination, message)
+            continue
         if destination.exists():
             destination = available_destination(source, destination.parent, reserved)
         try:
@@ -67,7 +73,7 @@ def flatten_videos(
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(
-        description="DEV ONLY: move nested video files to the top of a folder."
+        description="Move nested video files to the top of a folder."
     )
     parser.add_argument(
         "directory",

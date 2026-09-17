@@ -7,9 +7,11 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from app_paths import LEGACY_STATE_DIRECTORY, STATE_DIRECTORY
 
-STATE_DIRECTORY = Path(__file__).resolve().parent / ".drive-sorter-state"
 LAST_OPERATION_PATH = STATE_DIRECTORY / "last-operation.json"
+DEFAULT_LAST_OPERATION_PATH = LAST_OPERATION_PATH
+LEGACY_LAST_OPERATION_PATH = LEGACY_STATE_DIRECTORY / "last-operation.json"
 
 
 @dataclass(frozen=True)
@@ -34,15 +36,29 @@ def save_last_operation(operation: str, moves: list[MoveRecord]) -> None:
     temporary_path = LAST_OPERATION_PATH.with_suffix(".tmp")
     temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary_path.replace(LAST_OPERATION_PATH)
+    if LAST_OPERATION_PATH == DEFAULT_LAST_OPERATION_PATH:
+        try:
+            LEGACY_LAST_OPERATION_PATH.unlink(missing_ok=True)
+        except OSError:
+            # The old application directory may be read-only after installation.
+            pass
+
+
+def _available_history_path() -> Path:
+    if LAST_OPERATION_PATH.exists():
+        return LAST_OPERATION_PATH
+    if LAST_OPERATION_PATH == DEFAULT_LAST_OPERATION_PATH and LEGACY_LAST_OPERATION_PATH.exists():
+        return LEGACY_LAST_OPERATION_PATH
+    return LAST_OPERATION_PATH
 
 
 def load_last_operation() -> OperationHistory | None:
     """Return valid recorded history, treating a missing/corrupt record as unavailable."""
     try:
-        payload = json.loads(LAST_OPERATION_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(_available_history_path().read_text(encoding="utf-8"))
         operation = payload["operation"]
         moves = [MoveRecord(Path(move["source"]), Path(move["destination"])) for move in payload["moves"]]
-    except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError):
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
         return None
     if not isinstance(operation, str) or not moves:
         return None
@@ -51,6 +67,7 @@ def load_last_operation() -> OperationHistory | None:
 
 def undo_last_operation() -> tuple[list[str], OperationHistory | None]:
     """Move recorded files back without overwriting anything at their original paths."""
+    history_path = _available_history_path()
     history = load_last_operation()
     if history is None:
         return ["No undoable operation was found."], None
@@ -60,6 +77,12 @@ def undo_last_operation() -> tuple[list[str], OperationHistory | None]:
     for move in reversed(history.moves):
         if not move.destination.exists():
             messages.append(f"SKIPPED: {move.destination.name} is no longer at its recorded destination")
+            remaining.append(move)
+            continue
+        if not move.destination.is_file() or move.destination.is_symlink():
+            messages.append(
+                f"SKIPPED: {move.destination.name} is no longer a regular file"
+            )
             remaining.append(move)
             continue
         if move.source.exists():
@@ -77,6 +100,22 @@ def undo_last_operation() -> tuple[list[str], OperationHistory | None]:
 
     if remaining:
         save_last_operation(history.operation, list(reversed(remaining)))
+        if history_path != LAST_OPERATION_PATH:
+            try:
+                history_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return messages, OperationHistory(history.operation, list(reversed(remaining)))
-    LAST_OPERATION_PATH.unlink(missing_ok=True)
+    try:
+        history_path.unlink(missing_ok=True)
+    except OSError:
+        if history_path != LAST_OPERATION_PATH:
+            # A new empty marker takes precedence over an undeletable legacy record.
+            STATE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+            LAST_OPERATION_PATH.write_text(
+                json.dumps({"operation": history.operation, "moves": []}),
+                encoding="utf-8",
+            )
+        else:
+            raise
     return messages, None
