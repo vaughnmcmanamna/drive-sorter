@@ -53,8 +53,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${{ github.ref_name }}" *> $null
-          if ($LASTEXITCODE -ne 0) {
+          $null = gh release view "${{ github.ref_name }}"
+          $releaseExists = $LASTEXITCODE -eq 0
+          if (-not $releaseExists) {
             $notes = @'
           First public release of Drive Sorter. See CHANGELOG.md for the feature list.
 
