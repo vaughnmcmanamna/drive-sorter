@@ -37,8 +37,9 @@ class SanitizationTests(unittest.TestCase):
 
 
 class MetadataReaderTests(unittest.TestCase):
+    @patch("organizer.media_tool_path", return_value=Path("ffprobe"))
     @patch("organizer.subprocess.run")
-    def test_reads_title_and_creation_time(self, run: object) -> None:
+    def test_reads_title_and_creation_time(self, run: object, _tool: object) -> None:
         run.return_value = subprocess.CompletedProcess(
             [], 0, json.dumps({"format": {"tags": {"title": "Game", "creation_time": "2024-06-08T19:15:14Z"}}}), ""
         )
@@ -47,8 +48,9 @@ class MetadataReaderTests(unittest.TestCase):
         self.assertEqual(created.year, 2024)
         self.assertIsNone(error)
 
+    @patch("organizer.media_tool_path", return_value=Path("ffprobe"))
     @patch("organizer.subprocess.run", side_effect=subprocess.TimeoutExpired("ffprobe", 30))
-    def test_timeout_becomes_a_per_file_error(self, _run: object) -> None:
+    def test_timeout_becomes_a_per_file_error(self, _run: object, _tool: object) -> None:
         game, created, error = metadata_reader(Path("clip.mp4"))
         self.assertIsNone(game)
         self.assertIsNone(created)
@@ -455,7 +457,7 @@ class EmptyFolderTests(unittest.TestCase):
             leaf = root / "one" / "two"
             leaf.mkdir(parents=True)
             plan = build_empty_folder_plan(root)
-        self.assertEqual(plan, [leaf, leaf.parent])
+        self.assertEqual(plan, [leaf.resolve(), leaf.parent.resolve()])
 
     def test_keeps_folders_that_contain_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -466,7 +468,7 @@ class EmptyFolderTests(unittest.TestCase):
             occupied.mkdir()
             (occupied / ".hidden").touch()
             plan = build_empty_folder_plan(root)
-        self.assertEqual(plan, [empty])
+        self.assertEqual(plan, [empty.resolve()])
 
     def test_rechecks_emptiness_before_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
