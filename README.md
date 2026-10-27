@@ -1,5 +1,5 @@
 # Drive Sorter
-
+[![Build Windows release](https://github.com/vaughnmcmanamna/drive-sorter/actions/workflows/release.yml/badge.svg)](https://github.com/vaughnmcmanamna/drive-sorter/actions/workflows/release.yml)
 Drive Sorter is a Windows desktop utility that organizes game clips using video metadata. It reads the game title and creation year with FFprobe, previews every planned move, and sorts clips into:
 
 ```text
